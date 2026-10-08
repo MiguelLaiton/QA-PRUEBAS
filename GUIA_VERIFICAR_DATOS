@@ -1,0 +1,568 @@
+# Guía rápida: ver la web de Fixia y comprobar que los datos llegan a la base de datos
+
+Sirve para **Windows (PowerShell)** y para **Mac / Linux (terminal bash o zsh)**. Cada paso indica qué cambia de un sistema a otro.
+
+## Qué necesitas antes de empezar
+
+1. **Docker Desktop instalado y abierto** (en Linux: Docker Engine con Compose v2; si te pide permisos, antepón `sudo`).
+2. **Git**.
+3. Los repositorios clonados **en la misma carpeta** (`ms-orchestrator`, `ms-frontend`, `ms-users`, `ms-payments`, ...) y el archivo
+   `ms-orchestrator/.env` creado. Ambas cosas las hace el script `setup-dev.sh` de `ms-orchestrator`
+   (ver `README.md`, sección 2.1). Sin ese `.env` el back no arranca (`falta JWT_PRIVATE_KEY`).
+
+> En un Mac con chip Apple (M1/M2/M3) la imagen de Flutter se ejecuta emulada: el primer build del front puede tardar bastante más.
+
+---
+
+## 1. Abrir la terminal en la carpeta correcta
+
+Abre la terminal **dentro de la carpeta `ms-orchestrator`** (la ruta cambia según dónde la tengas):
+
+**Windows (PowerShell):**
+```powershell
+cd RUTA\A\TU\CARPETA\ms-orchestrator
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$env:PATH = "$env:LOCALAPPDATA\Programs\DockerDesktop\resources\bin;" + $env:PATH
+```
+
+**Mac / Linux:**
+```bash
+cd /ruta/a/tu/carpeta/ms-orchestrator
+```
+
+(Las dos últimas líneas de Windows hacen que se vean las tildes y evitan el error `docker-credential-desktop not found`.
+En Mac/Linux no hacen falta.)
+
+---
+
+## 2. Elegir la versión del front y levantar todo
+
+Desde el 7/10/2026 la rama `develop` del front ya incluye la **página de inicio**, el **login**, la **sesión** y el **registro de cliente conectado al back** (GC-253). Usa `develop`:
+
+```bash
+git -C ../ms-frontend fetch --all
+git -C ../ms-frontend checkout develop
+git -C ../ms-frontend pull
+```
+
+Desde el 8/10/2026 `develop` también incluye el **registro de técnico conectado al back** (GC-255 y GC-256, PR #27 y #28): su recorrido y la comprobación en la base de datos están en la sección 10.
+
+**El back también debe estar en `develop`.** `ms-users` se construye desde tu carpeta local `ms-users`. Si esa carpeta está en una rama anterior al 8/10 (por ejemplo tu rama de pruebas de QA, creada antes), la web mostrará el formulario de técnico pero el back **no tendrá el endpoint** y el registro fallará. Ponla en `develop` actualizado:
+
+```bash
+git -C ../ms-users fetch --all
+git -C ../ms-users checkout develop
+git -C ../ms-users pull
+```
+
+Si tienes cambios sin commit (tus pruebas de QA), guárdalos antes con `git -C ../ms-users stash -u` (y recupéralos después con `git -C ../ms-users stash pop`), o haz primero el commit de tu rama (README, sección 7). La primera vez, `ms-users` aplica las migraciones V4 y V5 (tablas `technicians` y `technician_categories`).
+
+> ### Importante desde el 8/10/2026: ajuste local del puerto del front
+>
+> DevOps cambió el `nginx.conf` del front de `develop` para que escuche en el puerto **8080** (así lo necesita Kubernetes). El `docker-compose.yml` de
+> `ms-orchestrator` todavía envía Traefik al puerto **80**. Resultado: con el compose tal cual, **`http://localhost` responde 502 Bad Gateway**.
+>
+> Hasta que DevOps corrija el compose, en tu computador usa un **archivo de ajuste aparte**. Así no se edita ningún archivo de los repositorios.
+> Es solo para tus pruebas locales: **no lo subas a ningún repositorio ni a QA/DevOps** (lo acordó Juan Pablo).
+>
+> 1. Crea el archivo `FIXIA-QA/docker-compose.qa-local.yml` (en la carpeta `FIXIA-QA`, que no es un repositorio) con este contenido:
+>
+>    ```yaml
+>    services:
+>      ms-frontend:
+>        labels:
+>          - "traefik.http.services.ms-frontend.loadbalancer.server.port=8080"
+>    ```
+>
+> 2. **Levanta siempre desde la carpeta `FIXIA-QA`** con este comando (reemplaza al de abajo):
+>
+>    ```powershell
+>    docker compose --project-directory ms-orchestrator -f ms-orchestrator/docker-compose.yml -f docker-compose.qa-local.yml --profile full --profile tools --profile observability up -d --build
+>    ```
+>
+> 3. **Regla antes de levantar una rama del front:** revisa su nginx.
+>
+>    ```powershell
+>    Select-String ms-frontend\nginx.conf -Pattern listen
+>    ```
+>
+>    - Si dice `listen 8080;` (rama al día con `develop`): usa el comando con el ajuste.
+>    - Si dice `listen 80;` (rama de PR que aún no se actualizó con `develop`): **no uses el ajuste** (daría 502); levanta con el comando normal de abajo.
+>
+> Cuando DevOps corrija el compose (la etiqueta `ms-frontend.loadbalancer.server.port` pasa de `80` a `8080`), borra `docker-compose.qa-local.yml` y vuelve al comando normal.
+> Comprobado el 8/10/2026: con el ajuste, `http://localhost/` responde 200 y `/api/users/me` responde 401.
+
+Esos comandos funcionan igual en Windows, Mac y Linux. Luego levanta todo (back, bases de datos, web y visor de la base de datos). Este es el comando **normal**, que sirve cuando el nginx del front dice `listen 80;` o cuando DevOps ya corrigió el compose; con el `develop` del 8/10/2026 usa el comando con ajuste de arriba:
+
+```bash
+docker compose --profile full --profile tools up -d --build
+```
+
+- Escribe `--build` con **dos guiones normales** (si copias desde Word o un PDF, a veces se convierten en un guion largo `–` y falla).
+- El primer build del front tarda varios minutos.
+- Si falla con `no such host`, es el DNS de Docker: ejecuta el mismo comando otra vez.
+
+Comprueba que todo esté arriba (las bases deben decir `healthy`):
+
+```bash
+docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+```
+
+---
+
+## 3. Direcciones, puertos y datos de acceso
+
+| Qué es | Dirección | Datos de acceso |
+|---|---|---|
+| **Web de Fixia** (pantalla de login) | http://localhost/#/login | — |
+| **Visor de la base de datos (Adminer)** | http://localhost:8081 | ver la tabla de abajo |
+| API de usuarios (no es una pantalla; solo recibe peticiones POST) | `http://localhost/api/users/...` | — |
+| Base de datos de usuarios (cliente SQL: DBeaver, etc.) | `127.0.0.1:5432` | usuario `user`, contraseña `password`, base `users_db` |
+| Base de datos de pagos | `127.0.0.1:5433` | usuario `user`, contraseña `password`, base `payments_db` |
+| Panel del gateway (Traefik; ver la sección 13) | http://localhost:8080 | — |
+| Monitoreo: Grafana (solo con el perfil `observability`; ver la sección 12) | http://localhost:3000 | usuario `admin`, contraseña `admin` |
+| Monitoreo: Prometheus (solo con el perfil `observability`) | http://localhost:9090 | — |
+
+> Si abres `http://localhost/api/users/clients` en el navegador verás un **401**: es normal, esa ruta solo acepta `POST`
+> (se usa desde el formulario o con los comandos de abajo).
+
+### Qué escribir en http://localhost:8081 (Adminer)
+
+| Campo | Valor |
+|---|---|
+| **Sistema** | `PostgreSQL` |
+| **Servidor** | `postgres-users` (no `localhost`) |
+| **Usuario** | `user` |
+| **Contraseña** | `password` |
+| **Base de datos** | `users_db` |
+
+Para mirar la base de **pagos**, cambia solo el servidor a `postgres-payments` y la base a `payments_db`.
+(Estos valores vienen de `ms-orchestrator/.env`; si alguien los cambió allí, usa los suyos.)
+
+**Cómo ver una tabla:** entra, haz clic en `users` (o `refresh_tokens`, `revoked_tokens`) y luego en **Select data**. Para refrescar, vuelve a pulsar **Select data**.
+
+---
+
+## 4. Registrar un cliente
+
+**Opción A — desde la web** (con `develop`): abre http://localhost, pulsa **Registrarse** (baja a *¿Cómo quieres usar Fixia?*) y elige **Registrarme como cliente** (o ve a http://localhost/#/registro-cliente), llena el formulario y envíalo. En el tipo de documento *Cédula* solo se admiten números; la contraseña debe tener de 8 a 20 caracteres con letras y números. Al terminar aparece *"¡Tu cuenta fue creada!"*.
+
+**Opción B — por la API.** No necesita el front:
+
+*Windows (PowerShell):*
+```powershell
+$body = @{ firstName="Ana"; lastName="Prueba"; documentType="CC"; documentNumber="QA900001"; email="ana.prueba@example.com"; phone="+573001112233"; password="Clave1234"; policyVersion="v1.0"; consentAccepted=$true } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://localhost/api/users/clients -ContentType "application/json" -Body $body
+```
+
+*Mac / Linux:*
+```bash
+curl -s -w "\nHTTP %{http_code}\n" -X POST http://localhost/api/users/clients -H "Content-Type: application/json" -d '{"firstName":"Ana","lastName":"Prueba","documentType":"CC","documentNumber":"QA900001","email":"ana.prueba@example.com","phone":"+573001112233","password":"Clave1234","policyVersion":"v1.0","consentAccepted":true}'
+```
+
+Responde `201` con el `id` y el rol `CLIENT`. Si responde `409`, ese correo o documento ya existe (cambia el correo y el
+número de documento, o bórralo con el paso 8).
+
+---
+
+## 5. Comprobar que quedó en la base de datos
+
+Funciona igual en Windows, Mac y Linux:
+
+```bash
+docker exec fixia-db-users psql -U user -d users_db -c "select email, role, status, left(password_hash,7) as hash, created_at from users where email='ana.prueba@example.com'"
+```
+
+Debe aparecer una fila con rol `CLIENT`, estado `ACTIVE` y un `hash` que empieza por `$2a$12$` (la contraseña **nunca** se guarda en claro).
+O en Adminer: tabla `users` → **Select data**.
+
+---
+
+## 6. Iniciar sesión en la web y comprobar la sesión
+
+1. Abre **http://localhost/#/login** y entra con el correo y la contraseña del paso 4.
+2. Debe mostrarte la pantalla de sesión con nombre, correo y rol `CLIENT`.
+3. Comprueba la sesión en la base de datos:
+
+```bash
+docker exec fixia-db-users psql -U user -d users_db -c "select created_at, revoked_at from refresh_tokens order by created_at desc limit 1"
+```
+
+Debe haber una fila nueva con `revoked_at` **vacío** (sesión activa).
+
+## 7. Cerrar sesión en la web y comprobar la revocación
+
+1. En la web pulsa **cerrar sesión**.
+2. Ejecuta de nuevo la misma consulta de `refresh_tokens`: ahora `revoked_at` debe tener fecha.
+3. Además debe existir una fila en `revoked_tokens`:
+
+```bash
+docker exec fixia-db-users psql -U user -d users_db -c "select jti, revoked_at from revoked_tokens"
+```
+
+Si ves esos cambios, **la web, el back y la base de datos están conectados**.
+
+---
+
+## 8. Borrar los datos de prueba
+
+Borra **solo** tu usuario de prueba (sus sesiones se borran con él):
+
+```bash
+docker exec fixia-db-users psql -U user -d users_db -c "delete from users where email='ana.prueba@example.com'"
+```
+
+Para apagar todo: `docker compose --profile full --profile tools --profile observability down`
+(con `-v` al final **se borran también todos los datos** de las bases).
+
+---
+
+## 9. Ejecutar las pruebas automáticas y ver el resultado en la terminal
+
+Se ejecutan **desde la carpeta que contiene `ms-users` y `ms-payments`** (la carpeta padre, no dentro de `ms-orchestrator`).
+Cada comando muestra, por cada prueba, **qué evalúa** y si **pasó** (`[PASO]`), **falló** (`[FALLO]` con el motivo) u **omitida** (`[OMITIDA]`),
+y al final el total y si se cumplió la cobertura del 85 %. La primera vez tarda (descarga dependencias); las siguientes son más rápidas.
+
+> Ejecuta **un comando a la vez**: dos Maven en paralelo comparten la caché y pueden fallar.
+
+**Windows (PowerShell)** — desde la carpeta padre:
+
+```powershell
+cd ..
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+$env:PATH = "$env:LOCALAPPDATA\Programs\DockerDesktop\resources\bin;" + $env:PATH
+
+# ms-users: todas las pruebas (unitarias + integración) y cobertura
+docker run --rm -v "${PWD}\ms-users:/src:ro" -v fixia-m2:/root/.m2 maven:3.9.9-eclipse-temurin-21 sh -c "cp -r /src /w && cd /w && mvn -B verify" | Select-String -CaseSensitive -Pattern "^====|^  \[|^            Motivo|Tests run:.*Skipped: \d+$|BUILD|coverage checks" | ForEach-Object { $_.Line }
+
+# ms-payments
+docker run --rm -v "${PWD}\ms-payments:/src:ro" -v fixia-m2:/root/.m2 maven:3.9.9-eclipse-temurin-21 sh -c "cp -r /src /w && cd /w && mvn -B verify" | Select-String -CaseSensitive -Pattern "^====|^  \[|^            Motivo|Tests run:.*Skipped: \d+$|BUILD|coverage checks" | ForEach-Object { $_.Line }
+```
+
+**Mac / Linux** — desde la carpeta padre:
+
+```bash
+# ms-users: todas las pruebas (unitarias + integración) y cobertura
+docker run --rm -v "$(pwd)/ms-users:/src:ro" -v fixia-m2:/root/.m2 maven:3.9.9-eclipse-temurin-21 sh -c "cp -r /src /w && cd /w && mvn -B verify" | grep -E '^====|^  \[|^            Motivo|Tests run:.*Skipped: [0-9]+$|BUILD|coverage checks'
+
+# ms-payments
+docker run --rm -v "$(pwd)/ms-payments:/src:ro" -v fixia-m2:/root/.m2 maven:3.9.9-eclipse-temurin-21 sh -c "cp -r /src /w && cd /w && mvn -B verify" | grep -E '^====|^  \[|^            Motivo|Tests run:.*Skipped: [0-9]+$|BUILD|coverage checks'
+```
+
+*(Git Bash en Windows: usa `MSYS_NO_PATHCONV=1` antes de `docker` y `$(pwd -W)` en lugar de `$(pwd)`.)*
+
+**Solo unitarias** (rápidas): cambia `mvn -B verify` por `mvn -B test -Dgroups=unit`.
+**Solo integración:** cambia por `mvn -B test -DexcludedGroups=unit`.
+**Una clase:** `mvn -B test -Dtest=TokenServiceUnitTest`.
+
+Resultado esperado de `ms-users` sobre el `develop` del 8/10/2026 (ya con el back de técnicos): `Tests run: 291, Failures: 0, Errors: 0, Skipped: 1` (la omitida es el defecto conocido DEF-QA-01). Con el `develop` anterior eran 269 y 4 omitidas (3 esperaban el endpoint de técnicos, que ya existe),
+`All coverage checks have been met.` y `BUILD SUCCESS`. De `ms-payments`: `Tests run: 4, ... BUILD SUCCESS`.
+
+Así se ve la salida:
+
+```
+==== AuthServiceUnitTest [unit] - CA-14 / RF-004: credenciales válidas inician sesión; las inválidas no revelan el motivo del rechazo.
+  [PASO]    Con credenciales válidas emite los tokens
+  [PASO]    Una cuenta deshabilitada no inicia sesión aunque la contraseña sea correcta
+  [OMITIDA] Cerrar sesión varias veces de forma simultánea es idempotente
+            Motivo: DEF-QA-01: el logout concurrente con el mismo token responde 409 en lugar de ser idempotente
+```
+
+---
+
+## 10. Registro de técnico (GC-255 y GC-256) y perfil profesional: de la landing a la base de datos
+
+### 10.1 Estado (8/10/2026)
+
+| Pieza | Estado |
+|---|---|
+| Formulario de registro de técnico (GC-255, PR #27) | **Integrado en `develop`** |
+| Registro conectado con `ms-users` (GC-256, PR #28) | **Integrado.** `POST /api/users/technicians` crea una cuenta con rol `PROFESSIONAL` y verificación `PENDING` |
+| Back de técnicos (GC-254, GC-261 y GC-262) | **Integrado en `develop`** (migraciones V4 y V5) |
+| Pantalla para completar el perfil profesional | **No existe todavía.** El perfil (descripción, años y categorías) se completa por la API (10.4); en el formulario es el paso 2, *"Completa tu perfil profesional"* |
+| Aprobación o verificación del técnico | No hay flujo: la cuenta queda en `PENDING` |
+
+Cambios respecto a la rama que se revisó antes del 8/10: el registro de técnico **ya no pide Profesión** (las categorías se eligen en el perfil, que es donde el back las guarda), usa el mismo formulario y las mismas validaciones que el de cliente, y el enlace dice *"Regístrate como cliente"*.
+
+### 10.2 Recorrido desde la landing, con datos y base de datos
+
+1. Abre **http://localhost** y pulsa **Registrarse**: baja a *"¿Cómo quieres usar Fixia?"*. Elige **Registrarme como técnico**.
+2. Debe verse: la etiqueta *"Cuenta de técnico"*, el título *"Crea tu cuenta de técnico"*, los 3 pasos (*Crea tu cuenta*, *Completa tu perfil profesional*, *Verificación de Fixia*), la columna *"¿Por qué unirte a Fixia?"*, todos los campos con ícono, el ojo en **Contraseña** y en **Confirmar contraseña**, y los enlaces *"Inicia sesión"* y *"¿Buscas un técnico? Regístrate como cliente"*.
+3. **Envíalo vacío** (botón **Crear cuenta**): mensajes en rojo bajo cada campo; no se envía nada.
+4. Llénalo: **Nombres** `Tec`, **Apellidos** `Prueba`, **Tipo de documento** *Cédula de ciudadanía*, **Número de documento** `910001` (solo números), **Correo electrónico** `tec.prueba@example.com`, **Teléfono celular** `3001112233`, **Contraseña** y **Confirmar contraseña** `Clave1234`, y marca el consentimiento. Pulsa **Crear cuenta**.
+5. Resultado esperado: *"¡Tu cuenta de técnico fue creada!"*, con el correo y el aviso *"Tu cuenta queda pendiente de verificación"*, y el botón **Ir a iniciar sesión**.
+6. Comprueba la base de datos:
+
+   ```bash
+   docker exec fixia-db-users psql -U user -d users_db -c "select email, role, status, consent_policy_version, left(password_hash,7) as hash from users where email='tec.prueba@example.com'"
+   docker exec fixia-db-users psql -U user -d users_db -c "select u.email, t.verification_status from technicians t join users u on u.id=t.user_id where u.email='tec.prueba@example.com'"
+   ```
+
+   Debe dar rol `PROFESSIONAL`, estado `ACTIVE`, política `v1.0`, hash que empieza por `$2a$12$` (BCrypt, nunca la clave en claro) y, en la segunda consulta, `PENDING`.
+7. Pulsa **Ir a iniciar sesión** (o **Iniciar sesión** en la landing) y entra con ese correo y contraseña: la pantalla debe decir *"Hola, Tec"* con **Rol: Técnico**.
+8. Pulsa **Cerrar sesión** y comprueba que la sesión quedó revocada (pasos 6 y 7 de esta guía):
+
+   ```bash
+   docker exec fixia-db-users psql -U user -d users_db -c "select count(*) filter (where revoked_at is null) as activas, count(*) as emitidas from refresh_tokens r join users u on u.id=r.user_id where u.email='tec.prueba@example.com'"
+   docker exec fixia-db-users psql -U user -d users_db -c "select count(*) as access_tokens_revocados from revoked_tokens"
+   ```
+
+   Debe dar `0` activas y subir en 1 los tokens revocados.
+
+### 10.3 Cuenta duplicada
+
+Repite el paso 4 con el **mismo correo** (o el mismo documento): la web debe mostrar *"Ya existe una cuenta con este correo o documento."* bajo **Número de documento** y **Correo electrónico**, y la base de datos no debe crear filas nuevas. La regla vale **entre roles**: si registras un técnico con el correo de un cliente, también responde `409`.
+
+```bash
+docker exec fixia-db-users psql -U user -d users_db -c "select count(*) as cuentas_con_ese_correo from users where email='tec.prueba@example.com'"
+```
+
+Debe seguir en `1`.
+
+### 10.4 Perfil profesional por la API (lo único que hoy no tiene pantalla)
+
+*Windows (PowerShell):*
+```powershell
+$login = Invoke-RestMethod -Method Post -Uri http://localhost/api/users/auth/login -ContentType "application/json" -Body (@{ email="tec.prueba@example.com"; password="Clave1234" } | ConvertTo-Json)
+$h = @{ Authorization = "Bearer " + $login.accessToken }
+
+# Perfil recién creado: sin descripción ni categorías, verificación PENDING
+Invoke-RestMethod -Method Get -Uri http://localhost/api/users/technicians/me/profile -Headers $h
+
+# Completar el perfil
+$perfil = @{ professionalDescription="Tecnico de pruebas QA"; yearsOfExperience=5; categories=@("PLUMBING","ELECTRICAL") } | ConvertTo-Json
+Invoke-RestMethod -Method Put -Uri http://localhost/api/users/technicians/me/profile -Headers $h -ContentType "application/json" -Body $perfil
+```
+
+*Mac / Linux:*
+```bash
+TOKEN=$(curl -s -X POST http://localhost/api/users/auth/login -H "Content-Type: application/json" -d '{"email":"tec.prueba@example.com","password":"Clave1234"}' | python3 -c "import sys,json; print(json.load(sys.stdin)['accessToken'])")
+curl -s http://localhost/api/users/technicians/me/profile -H "Authorization: Bearer $TOKEN"
+curl -s -w "\nHTTP %{http_code}\n" -X PUT http://localhost/api/users/technicians/me/profile -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"professionalDescription":"Tecnico de pruebas QA","yearsOfExperience":5,"categories":["PLUMBING","ELECTRICAL"]}'
+```
+
+Categorías válidas: `PLUMBING`, `ELECTRICAL`, `MAINTENANCE`, `LOCKSMITHING`, `PAINTING`, `CARPENTRY` (las 6 de la landing). Comprueba que se guardó:
+
+```bash
+docker exec fixia-db-users psql -U user -d users_db -c "select u.email, t.verification_status, t.years_of_experience as anios, (select string_agg(category, ', ' order by category) from technician_categories c where c.technician_id=t.id) as categorias from technicians t join users u on u.id=t.user_id where u.email='tec.prueba@example.com'"
+```
+
+Debe mostrar `PENDING`, `5` y `ELECTRICAL, PLUMBING`. Seguridad del perfil (respuestas esperadas):
+
+| Prueba | Respuesta |
+|---|---|
+| Sin token | `401` |
+| Con el token de un **cliente** | `403` |
+| `categories` vacío o `yearsOfExperience` fuera de 0 a 80 | `400` |
+| Token de un usuario que ya cerró sesión | `401` |
+
+### 10.5 Qué se verificó el 8/10/2026
+
+- **Front (`develop`, scripts del repo en Docker):** `flutter analyze` sin avisos; 180 pruebas pasan; cobertura 98,6 %, sobre el 80 % del CI y el 85 % del SRS. Con el umbral forzado a 99 % el script falla (el filtro bloquea).
+- **Back (`develop` de `ms-users` con las pruebas de QA):** 291 pruebas, 290 pasan, 1 omitida (DEF-QA-01); el mínimo de cobertura se cumple.
+- **Desde la landing, en Chrome:** cliente (registro `201`, login `200`, cierre de sesión `204`) y técnico (`201`, `200`, `204`); cuenta duplicada `409`, también entre roles.
+- **Base de datos:** `CLIENT` y `PROFESSIONAL` con consentimiento `v1.0` y clave BCrypt; fila en `technicians` con `PENDING`; sesiones revocadas; perfil con categorías guardadas; el duplicado no crea filas.
+- **Infraestructura:** Traefik con 6 rutas y 7 servicios sin errores; Prometheus con los 10 objetivos arriba; panel de Grafana disponible.
+
+### 10.6 Si algo falla
+
+| Síntoma | Qué hacer |
+|---|---|
+| El registro de técnico responde `401` o `404` en `/api/users/technicians` | Tu `ms-users` local no está en `develop`. Sigue la sección 2 (poner `ms-users` en `develop`) y reconstruye: `docker compose ... up -d --build ms-users` |
+| `ms-users` no arranca y el log habla de Flyway | La base tiene migraciones que tu código no conoce (por ejemplo, venías de `develop` y volviste a una rama vieja). Borra los datos (`down -v`) y levanta de nuevo |
+| El perfil responde `403` | Estás usando el token de un cliente; usa el de la cuenta de técnico |
+
+### 10.7 Borrar los datos de prueba (solo los tuyos)
+
+```bash
+docker exec fixia-db-users psql -U user -d users_db -c "delete from users where email='tec.prueba@example.com'"
+```
+
+`refresh_tokens`, `technicians` y `technician_categories` se borran en cascada con el usuario.
+
+---
+
+## 11. Ver que las pantallas se ven bien (inicio, cliente y técnico)
+
+### 11.1 Qué debe verse en cada pantalla
+
+Abre cada dirección en el navegador (con el entorno levantado, paso 1 y 2):
+
+| Pantalla | Dirección | Qué debe verse |
+|---|---|---|
+| **Página de inicio** | http://localhost/#/ | Logo Fixia arriba a la izquierda; botones **Iniciar sesión** y **Registrarse**; título *"El técnico que necesitas, cuando lo necesitas."*; botón **Encontrar un técnico**; tarjeta oscura *"¿Por qué Fixia?"* con 3 puntos; sección *"Servicios para cada arreglo"* con 8 oficios con ícono (Electricidad, Plomería, Carpintería, Pintura, Cerrajería, Albañilería, Refrigeración, Jardinería) |
+| **Inicio de sesión** | http://localhost/#/login | Tarjeta con logo, *"Inicia sesión"*, campos **Correo electrónico** y **Contraseña** (con íconos y ojo para ver la clave), casilla *"Mantener sesión iniciada"*, botón **Iniciar sesión** y enlace **Crear cuenta** |
+| **Registro de cliente** | http://localhost/#/registro-cliente | *"Crea tu cuenta"*: Nombres, Apellidos, Tipo de documento, Número, Correo, Teléfono, Contraseña (con ayuda *"Mínimo 8 caracteres, con letras y números."*), Confirmar contraseña, consentimiento con *"versión v1.0"*, botón **Crear cuenta** |
+| **Registro de técnico** | http://localhost/#/registro-tecnico (o, desde la landing, **Registrarse** → **Registrarme como técnico**) | Dos columnas en computador: *"¿Por qué unirte a Fixia?"* y *"Crea tu cuenta de técnico"* con la etiqueta *"Cuenta de técnico"*, los 3 pasos, los mismos campos que el cliente (sin Profesión), ojo en las dos contraseñas y enlaces *"Inicia sesión"* y *"Regístrate como cliente"* |
+| **Cuenta creada** | (tras registrar un cliente o un técnico) | Check verde, *"¡Tu cuenta fue creada!"* (o *"¡Tu cuenta de técnico fue creada!"*), el correo y botón **Ir a iniciar sesión** |
+| **Sesión iniciada** | (tras iniciar sesión) | Check verde, *"Hola, <nombre>"*, tabla Nombre / Correo / Rol (*Cliente* o *Técnico*) y botón **Cerrar sesión** |
+
+### 11.2 Cómo verlas en computador y en celular
+
+1. Abre la pantalla y pulsa **F12** (en Mac: `Cmd + Opt + I`) para abrir las herramientas de desarrollo.
+2. Activa la **vista de dispositivo**: icono de celular/tablet, o `Ctrl + Shift + M` (Mac: `Cmd + Shift + M`).
+3. Elige un tamaño: **1280 px** (computador), **768 px** (tableta), **390 px** (celular actual) y **360 px / 320 px** (celulares pequeños). Recarga la página en cada tamaño.
+4. Prueba también el **zoom al 200 %** (`Ctrl` y `+`).
+
+### 11.3 Lista de comprobación visual (por pantalla y por tamaño)
+
+- [ ] El **logo** de Fixia se ve completo, y la tipografía es la de la marca (Inter), sin cuadros ni caracteres raros.
+- [ ] No hay **textos montados** ni elementos fuera de la tarjeta, y no aparece una barra de desplazamiento horizontal.
+- [ ] Los **botones** son claros, tienen buen tamaño y cambian al pasar el cursor.
+- [ ] Al enviar un formulario **vacío**, los mensajes aparecen **en rojo bajo cada campo** y nada se envía.
+- [ ] Los colores y la apariencia son **coherentes** entre inicio, login, cliente y técnico.
+- [ ] El **menú desplegable** (tipo de documento) se abre completo y se puede elegir con el mouse y con el teclado.
+- [ ] Se puede recorrer el formulario con **Tab** y enviar con **Enter**.
+
+### 11.4 Probar un recorrido completo con datos (y ver la base de datos)
+
+1. **Inicio → Registrarse** (o http://localhost/#/registro-cliente): llena el formulario de cliente y envíalo → pantalla *"¡Tu cuenta fue creada!"*. Comprueba la fila en `users` con el paso 5.
+2. **Ir a iniciar sesión**: entra con ese correo y contraseña → pantalla de sesión; comprueba `refresh_tokens` (paso 6).
+3. **Cerrar sesión** → vuelve al login; comprueba `revoked_tokens` (paso 7).
+4. Repite el recorrido como **técnico** (sección 10.2): landing → **Registrarse** → **Registrarme como técnico**, y comprueba `users` y `technicians` en la base de datos.
+
+### 11.5 Qué se observó en la revisión del 7/10/2026 (en un Chrome real, 1280, 390, 360 y 320 px)
+
+- **Bien:** inicio, login, registro de cliente y registro de técnico se ven bien y son coherentes; no hay desbordes horizontales ni a 360 ni a 320 px; la validación de formularios y el recorrido cliente → sesión → cierre funcionan, y los datos llegan a la base de datos.
+- **Mejorable (cosmético):** en pantallas de 360 px o menos algunos textos largos se cortan con "…" (la ayuda de la contraseña, y los nombres de los campos *Número de documento* y *Confirmar contraseña* dentro del campo).
+- **8/10/2026, técnico (GC-255 y GC-256, ya en `develop`):** se cumplieron los puntos que se habían pedido: íconos iguales a los del cliente en todos los campos, ojo independiente en *Confirmar contraseña*, validación que avisa al instante si las contraseñas no coinciden, enlace *"Inicia sesión"* y enlace *"Regístrate como cliente"*. En celulares de 360 px el nombre del campo *Confirmar contraseña* se corta con "…" por el ojo, igual que en otras pantallas.
+
+---
+
+## 12. Ver y verificar el monitoreo (Grafana y Prometheus)
+
+El monitoreo mide **si cada servicio está arriba y cuánto tarda en responder**. No muestra logs, alertas ni métricas internas de la aplicación (eso está pendiente, ver `TD_V1.docx`, OBS-03 y OBS-04).
+
+### 12.1 Levantarlo
+
+Grafana, Prometheus y Blackbox Exporter están en el perfil `observability`. Desde `ms-orchestrator`:
+
+```powershell
+docker compose --profile full --profile tools --profile observability up -d
+```
+
+Comprueba que estén arriba: `docker ps` debe listar `fixia-grafana`, `fixia-prometheus` y `fixia-blackbox`.
+
+### 12.2 Ver el panel en Grafana
+
+1. Abre **http://localhost:3000**.
+2. Entra con usuario `admin` y contraseña `admin` (si pide cambiarla, pulsa *Skip*).
+3. Abre directamente el panel en **http://localhost:3000/d/fixia-overview/fixia-disponibilidad**. También está en el menú izquierdo: **Dashboards → carpeta Fixia → Fixia - Disponibilidad**.
+
+**Qué debe verse:** la disponibilidad de cada servicio medido (la web `ms-frontend`, Kafka, RustFS, `ms-matching-geo`, `ms-payments` y las bases de datos, entre otros) y su latencia en gráficas. Con todo sano, los servicios aparecen **en verde, con valor 1**.
+
+### 12.3 Comprobar que realmente mide (apagar un servicio a propósito)
+
+1. Con el panel abierto, en la terminal: `docker stop ms-payments`
+2. Espera unos **15 segundos** y refresca el panel (botón de refrescar arriba a la derecha). `ms-payments` debe pasar a **rojo (0)**.
+3. Vuelve a levantarlo: `docker start ms-payments`. En unos 20 segundos debe volver a **verde (1)**.
+
+> Esta prueba se ejecutó el 7/10/2026: Prometheus marcó `ms-payments` en 0 a los 11 segundos de detenerlo y en 1 unos 20 segundos después de reiniciarlo.
+
+> **Cambio del 8/10/2026:** el nginx del front pasó del puerto 80 al **8080**. Prometheus debe sondear `http://ms-frontend:8080/` (en `ms-orchestrator/config/observability/prometheus.yml`). Si la web aparece **en rojo aunque abre**, tu archivo sigue apuntando a `ms-frontend:80`: cámbialo a `8080` y ejecuta `docker restart fixia-prometheus`. La serie vieja del puerto 80 se borra sola en unos minutos.
+
+### 12.4 Verificarlo sin Grafana (directo en Prometheus)
+
+| Dirección | Qué comprobar |
+|---|---|
+| http://localhost:9090/targets | Cada objetivo debe aparecer **UP** |
+| http://localhost:9090/graph, consulta `probe_success`, botón **Execute** | Cada servicio sano devuelve `1`; uno caído devuelve `0` |
+| http://localhost:9090/graph, consulta `probe_duration_seconds` | La latencia de cada servicio, en segundos |
+
+### 12.5 Si no funciona
+
+| Síntoma | Qué hacer |
+|---|---|
+| http://localhost:3000 no abre | El perfil no está levantado: ejecuta el comando del paso 12.1. Comprueba con `docker ps` que `fixia-grafana` esté `Up` |
+| No encuentra el panel "Fixia - Disponibilidad" | Espera 30 segundos tras levantar Grafana (carga el panel al arrancar) y refresca. Revisa `docker logs fixia-grafana` |
+| El panel aparece vacío ("No data") | Cambia el rango de tiempo (arriba a la derecha) a *Last 15 minutes* y espera un minuto: Prometheus necesita medir primero |
+| Todos los servicios salen rojos | Prometheus no alcanza a Blackbox: `docker restart fixia-blackbox fixia-prometheus` |
+| Solo se ve desde tu computador | Es lo esperado: los puertos 3000 y 9090 están limitados a `127.0.0.1` |
+
+Para apagar el monitoreo con el resto: `docker compose --profile full --profile tools --profile observability down`.
+
+---
+
+## 13. Traefik (el gateway): cómo explicarlo y probarlo
+
+Traefik es el **único punto de entrada** de Fixia. Todo llega por el puerto 80 (`http://localhost`) y Traefik decide a qué servicio mandar cada petición según el inicio de la ruta. Por eso la web y la API comparten el mismo origen y el front no necesita una URL distinta para el back.
+
+### 13.1 Qué ruta va a qué servicio
+
+| Ruta | Va a | Puerto interno | Prioridad |
+|---|---|---|---|
+| `/api/users/...` | `ms-users` | 8080 | 10 |
+| `/api/payments/...` | `ms-payments` | 8080 | 10 |
+| `/api/geo/...` | `ms-matching-geo` | 8000 | 10 |
+| cualquier otra (`/`, `/#/login`, ...) | `ms-frontend` (la web) | 80 | 1 |
+
+La **prioridad** es lo que hace que `/api/users` gane sobre `/`, que captura todo lo demás. No hay archivos de rutas: cada servicio declara las suyas con etiquetas (`labels`) en `ms-orchestrator/docker-compose.yml` (líneas 180 a 257) y Traefik las descubre solo (`--providers.docker=true`). Un servicio solo se expone si trae `traefik.enable=true`.
+
+### 13.2 Qué se ve en el panel (http://localhost:8080)
+
+Con Traefik 3.6.25 el panel muestra:
+
+| Elemento | Cantidad | Qué es |
+|---|---|---|
+| Entrypoints | 2 | `:80` ("web", el tráfico de Fixia) y `:8080` (el panel de Traefik) |
+| HTTP Routers | 6 | Los 4 de la tabla anterior y 2 internos de Traefik (la API y el panel) |
+| HTTP Services | 7 | Los 4 servicios de Fixia y 3 internos (`api`, `dashboard` y `noop`) |
+| HTTP Middlewares | 2 | Los del propio panel (redirección a `/dashboard/` y quitar el prefijo). Fixia no usa middlewares propios todavía |
+
+Todo debe verse en verde, con 0 advertencias y 0 errores. En **HTTP Routers** se ve cada regla `PathPrefix(...)`, su prioridad y su servicio.
+
+### 13.3 Probarlo con comandos
+
+En PowerShell se usa `curl.exe` (en PowerShell `curl` es otro comando):
+
+```powershell
+curl.exe -i http://localhost/
+curl.exe -i http://localhost/api/users/me
+curl.exe -i -X POST -H "Content-Type: application/json" -d "{}" http://localhost/api/users/clients
+curl.exe -i http://localhost/api/payments/x
+curl.exe -i http://localhost/api/geo/x
+```
+
+| Comando | Resultado esperado | Qué demuestra |
+|---|---|---|
+| `GET /` | **200**, HTML | Va a la web |
+| `GET /api/users/me` | **401** (JSON de error) | Llegó a `ms-users`, que pide token |
+| `POST /api/users/clients` con `{}` | **400** | Llegó a `ms-users`, que valida el cuerpo |
+| `GET /api/payments/x` | **404** en JSON | Llegó a `ms-payments`, que no tiene esa ruta |
+| `GET /api/geo/x` | **404** en JSON | Llegó a `ms-matching-geo` |
+
+El 401 y el 400 prueban que la petición **no** se quedó en la web: la respuesta viene del servicio. Los 404 en JSON también vienen del servicio (el 404 propio de Traefik es texto simple, `404 page not found`).
+
+### 13.4 Probar que el descubrimiento es automático
+
+1. Abre http://localhost:8080 → **HTTP Routers** y busca `ms-payments`.
+2. En la terminal: `docker stop ms-payments`. En unos segundos el router **desaparece** del panel.
+3. `docker start ms-payments`: a los ~25 segundos **reaparece solo**.
+
+> Probado el 7/10/2026: los routers de `ms-payments` pasaron de 1 a 0 y volvieron a 1.
+
+### 13.5 Un comportamiento que debes conocer
+
+Con `ms-payments` apagado, `GET /api/payments/x` responde **200 con HTML** y no un error. Al desaparecer su router, la petición cae en la regla `/`, que es la de la web, y devuelve la página de inicio. Es una consecuencia de este diseño: un servicio caído no da un error claro, y el front podría recibir HTML donde espera JSON. Mejoras posibles: un router de `/api` con prioridad más baja que devuelva 503, o apoyarse en el monitoreo de la sección 12 para detectar la caída.
+
+### 13.6 Notas
+
+- El panel está abierto (`--api.insecure=true`): el propio compose lo marca como **solo para desarrollo**.
+- La wiki deja pendiente decidir si Traefik reemplaza por completo al microservicio `fixia-apigateway` o si convive con un servicio delgado detrás; por eso existe la carpeta `ms-apigateway`.
+
+---
+
+## Si algo no funciona
+
+| Síntoma | Qué hacer |
+|---|---|
+| `unknown shorthand flag` o `–build` no reconocido | Escribiste un guion largo. Usa `--build` con dos guiones normales. |
+| `falta JWT_PRIVATE_KEY en .env` | No existe `ms-orchestrator/.env`. Ejecuta `setup-dev.sh` (README, sección 2.1). |
+| `no such host` | DNS intermitente de Docker: repite el comando. |
+| `docker-credential-desktop not found` (Windows) | Ejecuta la línea de `$env:PATH` del paso 1 en esa misma ventana. |
+| http://localhost no abre | Revisa `docker ps`: `ms-frontend` y `fixia-apigateway` deben estar `Up`. Espera unos segundos tras levantar. |
+| El registro de técnico falla (`401` o `404` en `/api/users/technicians`) | Tu `ms-users` local no está en `develop`. Ver la sección 2 y la 10.6. |
+| http://localhost responde **502 Bad Gateway** | El nginx del front escucha en 8080 y el compose enruta al 80. Levanta con el ajuste local (sección 2, "Importante desde el 8/10/2026"). Si estás en una rama de PR con `listen 80;`, es al revés: levanta **sin** el ajuste. |
+| Adminer no deja entrar | El servidor es `postgres-users` (no `localhost`); usuario `user`; contraseña `password`; base `users_db`. |
+| El registro por API da `409` | Ese correo o documento ya existe. Cambia los datos o bórralo (paso 8). |
+| Las tildes se ven raras en PowerShell | Ejecuta `[Console]::OutputEncoding = [Text.Encoding]::UTF8` en esa ventana. |
